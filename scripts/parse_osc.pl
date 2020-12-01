@@ -19,6 +19,7 @@ use Cwd qw(abs_path);
 my $wget = `/usr/bin/which wget` || 'wget';
 $wget =~ s/\s//s;
 my $state_file = dirname(abs_path(__FILE__)).'/state.txt';
+my $state_file_changeset = dirname(abs_path(__FILE__)).'/state.yaml';
 my $stop_file = abs_path(__FILE__);
 $stop_file =~ s/(\.pl|$)/.stop/;
 my $help;
@@ -114,6 +115,7 @@ sub update_state {
     print STDERR "Last state $cur, updating to state $last\n" if $verbose;
     for my $state ($cur+1..$last) {
         die "$stop_file found, exiting" if -f $stop_file;
+        update_state_changeset();
         my $osc_url = $state_url.sprintf("/%03d/%03d/%03d.osc.gz", int($state/1000000), int($state/1000)%1000, $state%1000);
         print STDERR $osc_url.': ' if $verbose;
         open FH, "$wget -q -O- $osc_url|" or die "Failed to open: $!";
@@ -122,6 +124,50 @@ sub update_state {
 
         open STATE, ">$state_file" or die "Cannot write to $state_file";
         print STATE "sequenceNumber=$state\n";
+        close STATE;
+    }
+}
+
+sub update_state_changeset {
+    my $state_url = "https://planet.openstreetmap.org/replication/changesets";
+    my $resp = $ua->get($state_url.'/state.yaml');
+    die "Cannot download $state_url/state.yaml: ".$resp->status_line unless $resp->is_success;
+    print STDERR "Reading state from $state_url/state.yaml\n" if $verbose;
+    $resp->content =~ /sequence: (\d+)/;
+    die "No sequence number in downloaded state.yaml" unless $1;
+    my $last_cs = $1;
+
+    if( !-f $state_file_changeset ) {
+        # if state file does not exist, create it with the latest state
+        open STATE, ">$state_file_changeset" or die "Cannot write to $state_file_changeset";
+        print STATE "sequence: $last_cs\n";
+        close STATE;
+    }
+
+    my $cur_cs = $last_cs;
+    open STATE, "<$state_file_changeset" or die "Cannot open $state_file_changeset";
+    while(<STATE>) {
+        $cur_cs = $1 if /sequence: (\d+)/;
+    }
+    close STATE;
+    die "No sequence number in file $state_file_changeset" if $cur_cs < 0;
+    die "Last state $last_cs is less than DB state $cur_cs" if $cur_cs > $last_cs;
+    if( $cur_cs == $last_cs ) {
+        print STDERR "Current changesets state is the last, no update of changesets needed.\n" if $verbose;
+    }
+
+    print STDERR "Last changesets state $cur_cs, updating to changesets state $last_cs\n" if $verbose;
+    for my $state ($cur_cs+1..$last_cs) {
+        die "$stop_file found, exiting" if -f $stop_file;
+        my $osc_url = $state_url.sprintf("/%03d/%03d/%03d.osm.gz", int($state/1000000), int($state/1000)%1000, $state%1000);
+        print STDERR $osc_url.': ' if $verbose;
+        open FH, "$wget -q -O- $osc_url|" or die "Failed to open: $!";
+        process_changesets(new IO::Uncompress::Gunzip(*FH));
+
+        close FH;
+
+        open STATE, ">$state_file_changeset" or die "Cannot write to $state_file_changeset";
+        print STATE "sequence: $state\n";
         close STATE;
     }
 }
@@ -146,7 +192,7 @@ sub process_osc {
                 my $changeset = $r->getAttribute('changeset');
                 my $change = $comments{$changeset};
                 if( !defined($change) ) {
-                    $change = get_changeset($changeset);
+                    $change = get_changeset_db($changeset);
                     $comments{$changeset} = $change;
                 }
                 $change->{$r->name.'s_'.$state}++;
@@ -192,6 +238,37 @@ sub process_osc {
         }
     }
     flush_tiles(\%tiles, \%comments) if scalar %tiles;
+    printf STDERR ", %d secs\n", tv_interval($clock) if $verbose;
+}
+
+sub process_changesets {
+    my $handle = shift;
+    my $r = XML::LibXML::Reader->new(IO => $handle);
+    my $change = {};
+    my %changes;
+    my $clock = [gettimeofday];
+    while($r->read) {
+        if( $r->nodeType == XML_READER_TYPE_ELEMENT ) {
+            if( $r->name eq 'changeset' ) {
+                # Process
+                $change->{id} = $r->getAttribute('id');
+                $change->{user_id} = $r->getAttribute('uid');
+                $change->{username} = $r->getAttribute('user');
+            } elsif( $r->name eq 'tag' ) {
+                my $k = $r->getAttribute('k');
+                my $v = $r->getAttribute('v');
+                if ($k eq 'created_by' || $k eq 'comment') {
+                    $change->{$k} = $v;
+                }
+            }
+        } elsif( $r->nodeType == XML_READER_TYPE_END_ELEMENT ) {
+            if ( $change->{id} ) {
+                $changes{$change->{id}} = $change;
+            }
+            $change = {};
+        }
+    }
+    flush_changesets(\%changes) if scalar %changes;
     printf STDERR ", %d secs\n", tv_interval($clock) if $verbose;
 }
 
@@ -257,12 +334,66 @@ SQL
     print STDERR " OK" if $verbose;
 }
 
+sub flush_changesets {
+    my $changes = shift;
+    printf STDERR "[Cnt: %d] ", scalar keys %{$changes} if $verbose;
+
+    my $sql = <<SQL;
+insert into ${dbprefix}changesets_online
+    (changeset_id, comment, user_id, user_name, created_by)
+    values (??)
+on duplicate key update
+    comment = values(comment)
+SQL
+
+    $db->begin;
+    eval {
+        print STDERR "Writing changesets" if $verbose;
+        for my $c (values %{$changes}) {
+            $c->{comment} = substr($c->{comment}, 0, 254);
+            $c->{comment} = strip_utf8mb4_chars($c->{comment});
+            $c->{username} = strip_utf8mb4_chars($c->{username});
+            $db->query($sql, $c->{id}, $c->{comment}, $c->{user_id}, $c->{username}, $c->{created_by}) or die $db->error;
+        }
+
+        $db->commit or die $db->error;
+    };
+    if( $@ ) {
+        my $err = "Transaction failed: $@";
+        eval { $db->rollback; };
+        die $err;
+    }
+    print STDERR " OK" if $verbose;
+}
+
 sub strip_utf8mb4_chars() {
     # MySQL "utf8" cannot handle Unicode characters above U+FFFF.
     # https://dev.mysql.com/doc/refman/5.7/en/charset-unicode-conversion.html
     my $str = shift;
     $str =~ s/[\x{10000}-\x{1ffff}]//g;
     return $str;
+}
+
+sub get_changeset_db {
+    my $changeset_id = shift;
+    my $c = {};
+
+    my $result = $db->query("SELECT * FROM ${dbprefix}changesets_online WHERE changeset_id=?", $changeset_id);
+    my $row = $result->hash;
+
+    $c->{id} = $changeset_id;
+    $c->{comment} = $row->{comment};
+    $c->{created_by} = $row->{created_by};
+    $c->{username} = $row->{user_name};
+    $c->{user_id} = $row->{user_id};
+    $c->{nodes_created} = 0; $c->{nodes_modified} = 0; $c->{nodes_deleted} = 0;
+    $c->{ways_created} = 0; $c->{ways_modified} = 0; $c->{ways_deleted} = 0;
+    $c->{relations_created} = 0; $c->{relations_modified} = 0; $c->{relations_deleted} = 0;
+
+    if ( ! $c->{username} ){
+        return get_changeset($changeset_id);
+    }
+    return $c;
 }
 
 sub get_changeset {
@@ -300,6 +431,7 @@ sub decode_xml_entities {
 sub create_table {
     $db->query("drop table if exists ${dbprefix}tiles") or die $db->error;
     $db->query("drop table if exists ${dbprefix}changesets") or die $db->error;
+    $db->query("drop table if exists ${dbprefix}changesets_online") or die $db->error;
 
     my $sql = <<SQL;
 CREATE TABLE ${dbprefix}tiles (
@@ -337,6 +469,17 @@ CREATE TABLE ${dbprefix}changesets (
     PRIMARY KEY (changeset_id),
     KEY idx_user (user_name),
     KEY idx_time (change_time)
+) ENGINE=MyISAM DEFAULT CHARSET=utf8
+SQL
+    $db->query($sql) or die $db->error;
+    $sql = <<SQL;
+CREATE TABLE ${dbprefix}changesets_online (
+    changeset_id int(10) unsigned NOT NULL,
+    comment varchar(254) DEFAULT NULL,
+    user_id mediumint(8) unsigned NOT NULL,
+    user_name varchar(96) NOT NULL,
+    created_by varchar(64) DEFAULT NULL,
+    PRIMARY KEY (changeset_id)
 ) ENGINE=MyISAM DEFAULT CHARSET=utf8
 SQL
     $db->query($sql) or die $db->error;
