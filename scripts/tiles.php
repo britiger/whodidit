@@ -36,7 +36,7 @@ else if (isset($_REQUEST['age']) && preg_match('/^\d+\s+(minute|hour|day|week|mo
     $age = $_REQUEST['age'];
 else
     $age = '7 day';
-$age_sql = $changeset && strpos($changeset, 'not in') === FALSE ? '' : " AND t.change_time > Date_sub(UTC_TIMESTAMP(), INTERVAL $age)";
+$age_sql = $changeset && strpos($changeset, 'not in') === FALSE ? '' : " AND t.change_time > NOW()-'$age days'::interval";
 $bbox_query = $extent ? '' : get_bbox_query($bbox);
 $editor = get_editor_query();
 $user = get_user_query();
@@ -49,8 +49,8 @@ if( $aggregate && !$aggregate_only_filtered && isset($aggregate_db_limit) && $ag
         $editor.
         $changeset.
         ' limit '.$aggregate_db_limit;
-    $tres = $db->query($test_sql);
-    $aggregate = $tres->num_rows < $aggregate_db_limit;
+    $tres = pg_query($db, $test_sql);
+    $aggregate = pg_num_rows($tres) < $aggregate_db_limit;
 }
 
 $tile_limit = $aggregate ? $aggregate_tile_limit : $small_tile_limit;
@@ -62,12 +62,12 @@ if( $tile_count > $tile_limit ) {
 if( $extent ) {
     // write bbox and exit
     $sql = 'select min(t.lon), min(t.lat), max(t.lon), max(t.lat) from wdi_tiles t, wdi_changesets c where c.changeset_id = t.changeset_id'.$age_sql.$user.$changeset;
-    $res = $db->query($sql);
-    if( $res === FALSE || $res->num_rows == 0 ) {
+    $res = pg_query($db, $sql);
+    if( $res === FALSE || pg_num_rows($res) == 0 ) {
         print '{ "error" : "Cannot determine bounds" }';
         exit;
     }
-    $row = $res->fetch_array();
+    $row = pg_fetch_array($res);
     print '[';
     if( !$row[0] && !$row[3] ) {
         print '"no results"';
@@ -87,7 +87,7 @@ if( $tile_count <= $small_tile_limit ) {
     $sql = 'select floor(t.lat/10) as rlat, floor(t.lon/10) as rlon';
     $tile_size *= 10;
 }
-$sql .= ', Substring_index(Group_concat(t.changeset_id ORDER BY t.changeset_id DESC SEPARATOR \',\'), \',\', 10) as changesets';
+$sql .= ', array_to_string((array_agg(t.changeset_id::character varying ORDER BY t.changeset_id DESC))[1:10], \',\') as changesets';
 $sql .= ', sum(t.nodes_created) as nc';
 $sql .= ', sum(t.nodes_modified) as nm';
 $sql .= ', sum(t.nodes_deleted) as nd';
@@ -101,17 +101,17 @@ $sql .= $editor;
 $sql .= $changeset;
 $sql .= ' group by rlat, rlon limit '.($db_tile_limit+1);
 
-$res = $db->query($sql);
+$res = pg_query($db, $sql);
 if (!$res) {
-    die($db->error);
-} else if( $res->num_rows > $db_tile_limit ) {
+    die(pg_last_error($db));
+} else if( pg_num_rows($res) > $db_tile_limit ) {
     print '{ "error" : "Too many tiles to display, please zoom in" }';
     exit;
 }
 
 print '{ "type" : "FeatureCollection", "features" : ['."\n";
 $first = true;
-while( $row = $res->fetch_assoc() ) {
+while( $row = pg_fetch_assoc($res) ) {
     if( !$first ) print ",\n"; else $first = false;
     $lon = $row['rlon'] * $tile_size;
     $lat = $row['rlat'] * $tile_size;

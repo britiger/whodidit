@@ -5,14 +5,13 @@ $frontend_url = $_SERVER['REQUEST_SCHEME'] . '://' . $_SERVER['HTTP_HOST'] . '/w
 
 function connect() {
     # host, user, password, database
-    $db = new mysqli('localhost', 'wdi', '', 'wdi');
-    $db->set_charset('utf8');
+    $db = pg_connect("host=localhost dbname=whodidit user=whodidit password=whodidit port=5435");
     return $db;
 }
 
 function db_escape_string($str) {
     global $db;
-    return $db->escape_string($str);
+    return pg_escape_string($db, $str);
 }
 
 function is_changeset_suspicious( $ch ) {

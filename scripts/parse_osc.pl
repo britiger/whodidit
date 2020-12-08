@@ -28,6 +28,7 @@ my $filename;
 my $url;
 my $database;
 my $dbhost = 'localhost';
+my $dbport = '5432';
 my $user;
 my $password;
 my $zipped;
@@ -45,6 +46,7 @@ GetOptions(#'h|help' => \$help,
            'h|host=s' => \$dbhost,
            'u|user=s' => \$user,
            'p|password=s' => \$password,
+           'o|port=s' => \$dbport,
            't|tilesize=f' => \$tile_size,
            'c|clear' => \$clear,
            's|state=s' => \$state_file,
@@ -57,8 +59,7 @@ if( $help ) {
 }
 
 usage("Please specify database and user names") unless $database && $user;
-my $db = DBIx::Simple->connect("DBI:mysql:database=$database;host=$dbhost;mysql_enable_utf8=1", $user, $password, {RaiseError => 1});
-$db->query("SET sql_mode = ''");
+my $db = DBIx::Simple->connect("DBI:Pg:database=$database;host=$dbhost;port=$dbport", $user, $password, {RaiseError => 1});
 create_table() if $clear;
 my $ua = LWP::UserAgent->new();
 $ua->env_proxy;
@@ -78,6 +79,7 @@ if( $filename ) {
 } elsif( $url ) {
     $url =~ s#^#http://# unless $url =~ m#://#;
     $url =~ s#/$##;
+    update_state_changeset();
     update_state($url);
 } else {
     usage("Please specify either filename or state.txt URL");
@@ -192,7 +194,11 @@ sub process_osc {
                 my $changeset = $r->getAttribute('changeset');
                 my $change = $comments{$changeset};
                 if( !defined($change) ) {
-                    $change = get_changeset_db($changeset);
+                    $change = {};
+                    $change->{id} = $changeset;
+                    $change->{nodes_created} = 0; $change->{nodes_modified} = 0; $change->{nodes_deleted} = 0;
+                    $change->{ways_created} = 0; $change->{ways_modified} = 0; $change->{ways_deleted} = 0;
+                    $change->{relations_created} = 0; $change->{relations_modified} = 0; $change->{relations_deleted} = 0;
                     $comments{$changeset} = $change;
                 }
                 $change->{$r->name.'s_'.$state}++;
@@ -254,6 +260,8 @@ sub process_changesets {
                 $change->{id} = $r->getAttribute('id');
                 $change->{user_id} = $r->getAttribute('uid');
                 $change->{username} = $r->getAttribute('user');
+                $change->{comment} = "";
+                $change->{created_by} = "";
             } elsif( $r->name eq 'tag' ) {
                 my $k = $r->getAttribute('k');
                 my $v = $r->getAttribute('v');
@@ -277,41 +285,38 @@ sub flush_tiles {my ($tiles, $chs) = @_;
 
     my $sql_ch = <<SQL;
 insert into ${dbprefix}changesets
-    (changeset_id, change_time, comment, user_id, user_name, created_by,
+    (changeset_id, change_time,
     nodes_created, nodes_modified, nodes_deleted,
     ways_created, ways_modified, ways_deleted,
     relations_created, relations_modified, relations_deleted)
     values (??)
-on duplicate key update
-    change_time = values(change_time),
-    nodes_created = nodes_created + values(nodes_created),
-    nodes_modified = nodes_modified + values(nodes_modified),
-    nodes_deleted = nodes_deleted + values(nodes_deleted),
-    ways_created = ways_created + values(ways_created),
-    ways_modified = ways_modified + values(ways_modified),
-    ways_deleted = ways_deleted + values(ways_deleted),
-    relations_created = relations_created + values(relations_created),
-    relations_modified = relations_modified + values(relations_modified),
-    relations_deleted = relations_deleted + values(relations_deleted)
+on conflict (changeset_id) do update set
+    change_time = excluded.change_time,
+    nodes_created = ${dbprefix}changesets.nodes_created + excluded.nodes_created,
+    nodes_modified = ${dbprefix}changesets.nodes_modified + excluded.nodes_modified,
+    nodes_deleted = ${dbprefix}changesets.nodes_deleted + excluded.nodes_deleted,
+    ways_created = ${dbprefix}changesets.ways_created + excluded.ways_created,
+    ways_modified = ${dbprefix}changesets.ways_modified + excluded.ways_modified,
+    ways_deleted = ${dbprefix}changesets.ways_deleted + excluded.ways_deleted,
+    relations_created = ${dbprefix}changesets.relations_created + excluded.relations_created,
+    relations_modified = ${dbprefix}changesets.relations_modified + excluded.relations_modified,
+    relations_deleted = ${dbprefix}changesets.relations_deleted + excluded.relations_deleted
 SQL
     my $sql_t = <<SQL;
 insert into ${dbprefix}tiles
     (lat, lon, latlon, changeset_id, change_time, nodes_created, nodes_modified, nodes_deleted)
-    values (?, ?, Point(?,?), ?, ?, ?, ?, ?)
-on duplicate key update
-    nodes_created = nodes_created + values(nodes_created),
-    nodes_modified = nodes_modified + values(nodes_modified),
-    nodes_deleted = nodes_deleted + values(nodes_deleted)
+    values (?, ?, ST_Point(?,?), ?, ?, ?, ?, ?)
+on conflict (changeset_id, lat, lon) do update set
+    nodes_created = ${dbprefix}tiles.nodes_created + excluded.nodes_created,
+    nodes_modified = ${dbprefix}tiles.nodes_modified + excluded.nodes_modified,
+    nodes_deleted = ${dbprefix}tiles.nodes_deleted + excluded.nodes_deleted
 SQL
 
     $db->begin;
     eval {
         print STDERR "Writing changesets" if $verbose;
         for my $c (values %{$chs}) {
-            $c->{comment} = substr($c->{comment}, 0, 254);
-            $c->{comment} = strip_utf8mb4_chars($c->{comment});
-            $c->{username} = strip_utf8mb4_chars($c->{username});
-            $db->query($sql_ch, $c->{id}, $c->{time}, $c->{comment}, $c->{user_id}, $c->{username}, $c->{created_by},
+            $db->query($sql_ch, $c->{id}, $c->{time},
                 $c->{nodes_created}, $c->{nodes_modified}, $c->{nodes_deleted},
                 $c->{ways_created}, $c->{ways_modified}, $c->{ways_deleted},
                 $c->{relations_created}, $c->{relations_modified}, $c->{relations_deleted}) or die $db->error;
@@ -342,8 +347,8 @@ sub flush_changesets {
 insert into ${dbprefix}changesets_online
     (changeset_id, comment, user_id, user_name, created_by)
     values (??)
-on duplicate key update
-    comment = values(comment)
+on conflict (changeset_id) do update set
+    comment = excluded.comment
 SQL
 
     $db->begin;
@@ -435,52 +440,76 @@ sub create_table {
 
     my $sql = <<SQL;
 CREATE TABLE ${dbprefix}tiles (
-    lat smallint(6) NOT NULL,
-    lon smallint(6) NOT NULL,
-    latlon point NOT NULL,
-    changeset_id int(10) unsigned NOT NULL,
-    change_time datetime NOT NULL,
-    nodes_created smallint(5) unsigned NOT NULL,
-    nodes_modified smallint(5) unsigned NOT NULL,
-    nodes_deleted smallint(5) unsigned NOT NULL,
-    PRIMARY KEY (changeset_id,lat,lon),
-    SPATIAL KEY idx_latlon (latlon),
-    KEY idx_time (change_time)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8
+    lat smallint NOT NULL,
+    lon smallint NOT NULL,
+    latlon geometry(point) NOT NULL,
+    changeset_id bigint NOT NULL,
+    change_time timestamp NOT NULL,
+    nodes_created smallint NOT NULL,
+    nodes_modified smallint NOT NULL,
+    nodes_deleted smallint NOT NULL,
+    PRIMARY KEY (changeset_id,lat,lon)
+);
+CREATE INDEX idx_latlon ON ${dbprefix}tiles(latlon);
+CREATE INDEX idx_tile_time ON ${dbprefix}tiles(change_time);
 SQL
     $db->query($sql) or die $db->error;
     $sql = <<SQL;
 CREATE TABLE ${dbprefix}changesets (
-    changeset_id int(10) unsigned NOT NULL,
-    change_time datetime NOT NULL,
+    changeset_id bigint NOT NULL,
+    change_time timestamp NOT NULL,
     comment varchar(254) DEFAULT NULL,
-    user_id mediumint(8) unsigned NOT NULL,
-    user_name varchar(96) NOT NULL,
+    user_id int DEFAULT NULL,
+    user_name varchar(96) DEFAULT NULL,
     created_by varchar(64) DEFAULT NULL,
-    nodes_created smallint(5) unsigned NOT NULL,
-    nodes_modified smallint(5) unsigned NOT NULL,
-    nodes_deleted smallint(5) unsigned NOT NULL,
-    ways_created smallint(5) unsigned NOT NULL,
-    ways_modified smallint(5) unsigned NOT NULL,
-    ways_deleted smallint(5) unsigned NOT NULL,
-    relations_created smallint(5) unsigned NOT NULL,
-    relations_modified smallint(5) unsigned NOT NULL,
-    relations_deleted smallint(5) unsigned NOT NULL,
-    PRIMARY KEY (changeset_id),
-    KEY idx_user (user_name),
-    KEY idx_time (change_time)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8
+    nodes_created smallint NOT NULL,
+    nodes_modified smallint NOT NULL,
+    nodes_deleted smallint NOT NULL,
+    ways_created smallint NOT NULL,
+    ways_modified smallint NOT NULL,
+    ways_deleted smallint NOT NULL,
+    relations_created smallint NOT NULL,
+    relations_modified smallint NOT NULL,
+    relations_deleted smallint NOT NULL,
+    PRIMARY KEY (changeset_id)
+);
+CREATE INDEX idx_user ON ${dbprefix}changesets(user_name);
+CREATE INDEX idx_cs_time ON ${dbprefix}changesets(change_time);
 SQL
     $db->query($sql) or die $db->error;
     $sql = <<SQL;
 CREATE TABLE ${dbprefix}changesets_online (
-    changeset_id int(10) unsigned NOT NULL,
+    changeset_id bigint NOT NULL,
     comment varchar(254) DEFAULT NULL,
-    user_id mediumint(8) unsigned NOT NULL,
+    user_id int NOT NULL,
     user_name varchar(96) NOT NULL,
     created_by varchar(64) DEFAULT NULL,
     PRIMARY KEY (changeset_id)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8
+);
+CREATE OR REPLACE FUNCTION ${dbprefix}add_changesets()
+  RETURNS TRIGGER 
+  LANGUAGE PLPGSQL
+  AS
+$$
+DECLARE
+  rs record;
+BEGIN
+  SELECT * INTO rs
+  FROM ${dbprefix}changesets_online
+  WHERE changeset_id=NEW.changeset_id
+  LIMIT 1;
+  NEW.user_name=rs.user_name;
+  NEW.user_id=rs.user_id;
+  NEW.comment=rs.comment;
+  NEW.created_by=rs.created_by;
+  RETURN NEW;
+END;
+$$
+CREATE TRIGGER ${dbprefix}trigger_add_changeset
+  BEFORE INSERT
+  ON ${dbprefix}changesets
+  FOR EACH ROW
+  EXECUTE PROCEDURE ${dbprefix}add_changesets();
 SQL
     $db->query($sql) or die $db->error;
     print STDERR "Database tables were recreated.\n" if $verbose;

@@ -46,7 +46,7 @@ $bbox_query = get_bbox_query_for_wkt($wkt);
 $editor_query = get_editor_query();
 $user_query = get_user_query();
 $sql = "select c.* from wdi_tiles t, wdi_changesets c where t.changeset_id = c.changeset_id $bbox_query $editor_query $user_query group by c.changeset_id order by c.change_time desc limit 20";
-$res = $db->query($sql);
+$res = pg_query($db, $sql);
 print <<<"XML"
 <?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -59,7 +59,7 @@ print <<<"XML"
 
 XML;
 date_default_timezone_set('UTC');
-while( $row = $res->fetch_assoc() ) {
+while( $row = pg_fetch_assoc($res) ) {
     $susp = is_changeset_suspicious($row) ? '[!] ' : '';
     $untitled = !$row['comment'] || strlen($row['comment']) <= 2 || substr($row['comment'], 0, 5) == 'BBOX:';
     print "\t<item>\n";

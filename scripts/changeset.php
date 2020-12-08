@@ -17,10 +17,10 @@ if( $latest ) {
     $where = 'changeset_id in ('.$_REQUEST['id'].') order by change_time desc';
 }
 
-$res = $db->query('select * from wdi_changesets where '.$where);
+$res = pg_query($db, 'select * from wdi_changesets where '.$where);
 print '[';
 $first = true;
-while( $row = $res->fetch_assoc() ) {
+while( $row = pg_fetch_assoc($res) ) {
     if( $first ) $first = false; else print ",\n";
     $row['suspicious'] = is_changeset_suspicious($row) ? 1 : 0;
     print json_encode($row);

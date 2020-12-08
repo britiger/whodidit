@@ -16,7 +16,7 @@ You will need `libxml2` and the development headers:
 
 Install Perl dependencies
 
-    cpan DBIx::Simple LWP::Simple XML::LibXML::Reader Devel::Size
+    cpan DBIx::Simple LWP::Simple XML::LibXML::Reader Devel::Size DBD::Pg
 
 ### Database
 
